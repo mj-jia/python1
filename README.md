@@ -2,7 +2,9 @@
 
 把微信等社交软件传过一遍、压糊了的图片，还原成清晰的样子。
 
-**[在线试用 →](https://mj-jia.github.io/python1/)**（纯浏览器推理，图片不上传服务器）
+[![打开在线版](https://img.shields.io/badge/Live_Demo-mj--jia.github.io%2Fpython1-2ea44f?style=for-the-badge)](https://mj-jia.github.io/python1/)
+
+纯浏览器推理，图片不上传服务器，点开就能用。
 
 ![效果对比](experiments/figures/g_result_zoom.png)
 

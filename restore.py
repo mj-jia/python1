@@ -28,7 +28,12 @@ sys.path.insert(0, str(ROOT))
 
 from src.models.srvgg import build_model  # noqa: E402
 
-DEFAULT_CKPT = ROOT / "experiments" / "exp_G" / "best.pth"
+# 权重优先用仓库里的 checkpoints/best.pth；本地训练产物在 experiments/exp_*/ 下时也能兜住
+CKPT_CANDIDATES = [
+    ROOT / "checkpoints" / "best.pth",
+    ROOT / "experiments" / "exp_G" / "best.pth",
+]
+DEFAULT_CKPT = next((p for p in CKPT_CANDIDATES if p.exists()), CKPT_CANDIDATES[0])
 DEFAULT_TILE = 512
 DEFAULT_OVERLAP = 48
 
@@ -51,6 +56,12 @@ class Restorer:
             device or ("cuda" if torch.cuda.is_available() else "cpu")
         )
         self.model = build_model(scale=1).to(self.device)
+        if not Path(ckpt).is_file():
+            raise FileNotFoundError(
+                f"找不到模型权重: {ckpt}\n"
+                "仓库自带权重在 checkpoints/best.pth，用默认参数即可；"
+                "自己训练的可用 --ckpt 指到 experiments/exp_X/best.pth"
+            )
         state = torch.load(str(ckpt), map_location="cpu")
         self.model.load_state_dict(state.get("params", state), strict=False)
         self.model.eval()

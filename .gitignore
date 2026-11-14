@@ -1,0 +1,22 @@
+# 推理输出
+outputs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 训练产物：权重只在 checkpoints/ 保留一份，消融实验目录不入库
+experiments/exp_*/
+experiments/*.log
+
+# 数据集不入库（DIV2K 需自行获取后放到这里）
+SR_Project/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -3,7 +3,7 @@
 开这两个头之后浏览器才会启用 SharedArrayBuffer，onnxruntime-web 才能多线程，
 WASM 推理速度能快 3~4 倍。
 
-用法: python web/serve.py [端口]
+用法: python serve.py [端口]
 """
 import http.server
 import socketserver

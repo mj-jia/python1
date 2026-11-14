@@ -1,0 +1,3 @@
+# onnxruntime-web 运行时与 COI worker 属于第三方产物，不参与语言统计
+ort/** linguist-vendored
+coi-serviceworker.min.js linguist-vendored

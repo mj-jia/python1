@@ -1,0 +1,67 @@
+# 传图复原 · 浏览器版
+
+纯前端推理，图片不上传服务器，你的电脑关机也能用。
+
+## 本地打开
+
+```bash
+python web/serve.py 8000
+# 浏览器打开 http://127.0.0.1:8000
+```
+
+**不要直接双击 `index.html`**——浏览器对 `file://` 协议禁止加载模型，必须走 http。
+
+## 部署到网上（免费）
+
+以 GitHub Pages 为例：
+
+1. 新建一个仓库
+2. 把 `web/` 目录里的**全部文件**传到仓库根目录
+3. 仓库 Settings → Pages → Source 选 `main` 分支 → Save
+4. 等 1 分钟，访问 `https://<用户名>.github.io/<仓库名>/`
+
+Cloudflare Pages、Netlify、Vercel 同理，直接拖 `web/` 目录上去即可。
+
+### 为什么第一次打开会闪一下
+
+页面里有个 `coi-serviceworker.min.js`，它注册 Service Worker 来注入
+`Cross-Origin-Opener-Policy` / `Cross-Origin-Embedder-Policy` 两个响应头。
+有了这两个头，浏览器才允许 `SharedArrayBuffer`，推理才能开多线程。
+
+GitHub Pages 不允许自定义响应头，所以只能靠这个 worker 补。它会在首次访问时
+自动刷新一次页面，之后就正常了。
+
+**如果不想要这个闪烁**：用 Cloudflare Pages 并加一个 `_headers` 文件：
+
+```
+/*
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+```
+
+然后删掉 `index.html` 里的 `coi-serviceworker.min.js` 那行 script。
+
+## 性能
+
+| 环境 | 512×512 | 1080p |
+|---|---|---|
+| 多线程（推荐） | ~15 s | ~2 min |
+| 单线程（多线程被禁） | ~55 s | ~7 min |
+
+速度取决于 CPU 核数。多线程靠 Service Worker 注入的头，单线程是浏览器不支持时的兜底。
+
+## 文件说明
+
+| 文件 | 作用 | 大小 |
+|---|---|---|
+| `index.html` | 全部界面与推理逻辑 | 12 KB |
+| `restore.onnx` | 模型（1.15M 参数） | 4.5 MB |
+| `coi-serviceworker.min.js` | 注入 COOP/COEP，启用多线程 | 2.3 KB |
+| `ort/` | onnxruntime-web 运行时 | ~36 MB |
+| `serve.py` | 本地带头的静态服务器 | 2 KB |
+
+## 局限
+
+- 2 倍下采样丢掉的细节无法真正重建，模型只做去伪影与合理补全
+- 浏览器单线程下大图会慢，建议长边不超过 2048
+- 老浏览器（不支持 WebAssembly）无法使用

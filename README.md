@@ -114,7 +114,7 @@ python serve.py 8000
 ### 命令行
 
 ```bash
-pip install torch opencv-python numpy lpips
+pip install -r requirements.txt
 python restore.py 我的糊图.jpg
 # 输出到 outputs/
 ```
@@ -128,15 +128,17 @@ bash scripts/run_ablation.sh 6000      # 四组消融
 python src/train/train_sr.py --exp D --iters 6000
 ```
 
-数据放在 `SR_Project/dataset/DIV2K_train_HR`，详见 `docs/完整项目流程.md`。
+**数据集不随仓库分发。** 需自行获取 [DIV2K](https://data.vision.ee.ethz.ch/cvl/DIV2K/)，放进 `SR_Project/dataset/DIV2K_train_HR`（800 张）与 `DIV2K_valid_HR`（100 张），脚本按这个相对路径读取；划分与评测口径见 `docs/完整项目流程.md`。
 
 ## 代码结构
 
 ```
-├── index.html              网页版（含全部推理逻辑）
-├── ort/                    onnxruntime-web 运行时
+├── index.html              网页版界面与推理逻辑（含分块与羽化拼接）
+├── ort/                    onnxruntime-web 运行时（第三方，约 36MB）
 ├── restore.onnx            网页用的模型（ONNX，4.5MB）
-├── restore.py              命令行复原（PyTorch）
+├── coi-serviceworker.min.js 注入 COOP/COEP，启用多线程推理
+├── serve.py                本地带头静态服务器
+├── restore.py              命令行复原（PyTorch，带 tiling 与羽化拼接）
 ├── src/
 │   ├── degrade/            退化流水线（纯 numpy DCT）
 │   ├── models/             SRVGGNetCompact
@@ -145,10 +147,16 @@ python src/train/train_sr.py --exp D --iters 6000
 │   └── data/               数据集与在线退化
 ├── tools/                  核验、汇总、出图
 ├── scripts/                批量训练脚本
-├── checkpoints/best.pth    训练好的模型权重
+├── checkpoints/best.pth    训练好的模型权重（restore.py 默认加载）
 ├── experiments/            结果表与对比图
-└── docs/                   完整流程、选题论证、网页版说明
+├── docs/                   完整流程、选题论证、网页版说明
+├── requirements.txt        Python 依赖
+├── LICENSE                 BSD-3-Clause
+├── .gitignore              忽略 outputs/、数据集、训练产物
+└── .gitattributes          第三方产物不计入语言统计
 ```
+
+**根目录位置不能随便改**：`index.html`、`ort/`、`restore.onnx`、`coi-serviceworker.min.js` 必须待在仓库根目录——GitHub Pages 只能发布根目录或 `/docs`，挪进子目录会让首页 404。其余 Python 代码的摆放不受这个限制。
 
 ## 局限
 

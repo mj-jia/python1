@@ -6,9 +6,9 @@
 
 纯浏览器推理，图片不上传服务器，点开就能用。
 
-![效果对比](experiments/figures/g_result_zoom.png)
+![效果对比](experiments/figures/g_result.png)
 
-左：原图　中：传输退化后　右：复原结果
+左：传输退化后　中：复原结果（G）　右：原图（GT）
 
 ---
 

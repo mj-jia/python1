@@ -4,9 +4,9 @@
 
 **[在线试用 →](https://mj-jia.github.io/python1/)** ·纯浏览器推理，图片不上传服务器
 
-![对比](experiments/figures/gan_zoom.png)
+![对比](experiments/figures/g_result.png)
 
-每行是一个场景，从左到右：传输退化 → G 复原（无 GAN）→ H2 复原（加 GAN）→ 原图（GT）
+每行是一个场景，从左到右：传输退化 → 复原结果（G）→ 原图（GT）
 
 ---
 

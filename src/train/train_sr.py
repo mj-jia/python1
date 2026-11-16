@@ -75,13 +75,53 @@ def get_args() -> argparse.Namespace:
     # 允许手动覆盖实验开关
     ap.add_argument("--block", type=str, default=None, choices=["on", "off"])
     ap.add_argument("--spatial", type=str, default=None, choices=["on", "off"])
+    # ---------------- 空间非均匀改造的四组开关 ----------------
+    ap.add_argument(
+        "--degrade-mode",
+        type=str,
+        default="legacy",
+        choices=["legacy", "official", "link"],
+        help="legacy=原有两段式；official=Real-ESRGAN 式两代均匀；link=社交链路式多代+相位漂移",
+    )
+    ap.add_argument(
+        "--block-mode",
+        type=str,
+        default="single",
+        choices=["single", "multi"],
+        help="single=只在单一对齐网格上算块效应损失；multi=多相位取最大",
+    )
+    ap.add_argument("--n-gen", type=str, default="1,5", help="链路式退化代次区间，如 1,5")
+    ap.add_argument("--hr-train", type=str, default=str(DIV2K / "DIV2K_train_HR"))
+    ap.add_argument("--hr-val", type=str, default=str(DIV2K / "DIV2K_valid_HR"))
+    ap.add_argument("--tag", type=str, default=None, help="输出目录后缀，便于同机多组并行")
     return ap.parse_args()
 
 
-def build_degrade_cfg(scale: int, uniform: bool) -> DegradeConfig:
+def build_degrade_cfg(
+    scale: int, uniform: bool, mode: str = "legacy", n_gen: tuple = (1, 5)
+) -> DegradeConfig:
+    """构造退化配置。
+
+    official : 两代、每代整图统一质量、无相位漂移、不改尺寸
+               （对应 Real-ESRGAN 的二阶均匀退化，作为"现有做法"的对照）
+    link     : 1~5 代、逐块内容自适应质量、每代随机改尺寸、网格相位漂移
+               （对应真实社交转发链路，作为本项目的做法）
+    legacy   : 完全保持原有行为，老实验可复现
+    """
     cfg = DegradeConfig(scale_choices=(scale,))
-    if uniform:
+    if mode == "official":
         cfg.uniform_quality = True
+        cfg.uniform_q_range = (30.0, 90.0)
+        cfg.n_gen_range = (2, 2)
+        cfg.phase_drift = False
+        cfg.resize_gen_prob = 0.0
+    elif mode == "link":
+        cfg.uniform_quality = False
+        cfg.n_gen_range = (int(n_gen[0]), int(n_gen[1]))
+        cfg.phase_drift = True
+        cfg.resize_gen_prob = 0.5
+    else:
+        cfg.uniform_quality = bool(uniform)
     return cfg
 
 
@@ -94,37 +134,50 @@ def build_losses(args, flags, block_size: int, device):
         ).to(device)
     block = None
     if flags["block"]:
-        block = BlockinessLoss(block=block_size).to(device)
+        block = BlockinessLoss(
+            block=block_size, phases=16 if args.block_mode == "multi" else 1
+        ).to(device)
     return l1, spatial, block
 
 
-def validate(model, cfg, args, device, fixed_seed=1234) -> dict:
+# 评测时的候选相位：同时给出"对齐网格"和"最坏相位"两个块效应读数
+PHASES = [(r, c) for r in (0, 2, 4, 6) for c in (0, 2, 4, 6)]
+
+
+def validate(model, cfg, args, device, tag: str = "", fixed_seed: int = 1234) -> dict:
+    """固定种子退化下的 PSNR 与块效应。
+
+    blk_aligned 只在 (0,0) 相位上量；blk_worst 取 16 个相位的最大，
+    后者才是"网格错位后真实可见的块效应"，也是本项目要压下去的指标。
+    """
     ds = PaiRedEvalDataset(
-        DIV2K / "DIV2K_valid_HR",
+        args.hr_val,
         cfg=cfg,
         seed=fixed_seed,
         crop=args.patch,
         max_images=args.val_images,
     )
     loader = DataLoader(ds, batch_size=1, num_workers=2, shuffle=False)
+    block = 8 * args.scale
     model.eval()
-    ps, bs_pred, bs_gt = [], [], []
+    ps, worst_p, worst_g, aligned_p = [], [], [], []
     with torch.no_grad():
         for deg, gt, _ in loader:
             deg, gt = deg.to(device), gt.to(device)
             pred = model(deg).clamp(0, 1)
             # 注意：张量在 [0,1]，peak 必须传 1.0
-            ps.append(
-                psnr_np(gt[0].cpu().numpy(), pred[0].cpu().numpy(), peak=1.0)
-            )
-            bs_pred.append(float(blockiness_tensor(pred, 8 * args.scale).mean()))
-            bs_gt.append(float(blockiness_tensor(gt, 8 * args.scale).mean()))
+            ps.append(psnr_np(gt[0].cpu().numpy(), pred[0].cpu().numpy(), peak=1.0))
+            vp = [float(blockiness_tensor(pred, block, phase=ph).mean()) for ph in PHASES]
+            vg = [float(blockiness_tensor(gt, block, phase=ph).mean()) for ph in PHASES]
+            worst_p.append(max(vp))
+            worst_g.append(max(vg))
+            aligned_p.append(vp[0])
     model.train()
     return {
-        "psnr": float(np.mean(ps)),
-        "blockiness_pred": float(np.mean(bs_pred)),
-        "blockiness_gt": float(np.mean(bs_gt)),
-        "blockiness_deg": 0.0,
+        f"psnr{tag}": float(np.mean(ps)),
+        f"blk_worst{tag}": float(np.mean(worst_p)),
+        f"blk_worst_gt{tag}": float(np.mean(worst_g)),
+        f"blk_aligned{tag}": float(np.mean(aligned_p)),
     }
 
 
@@ -141,11 +194,19 @@ def main() -> int:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     out_dir = Path(args.out) if args.out else ROOT / "experiments" / f"exp_{args.exp}"
+    if args.tag:
+        out_dir = out_dir.parent / f"{out_dir.name}_{args.tag}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    cfg = build_degrade_cfg(args.scale, flags["uniform_degrade"])
+    n_gen = tuple(int(v) for v in args.n_gen.split(","))
+    if len(n_gen) != 2:
+        raise ValueError("--n-gen 需要形如 1,5")
+
+    cfg = build_degrade_cfg(args.scale, flags["uniform_degrade"], args.degrade_mode, n_gen)
+    cfg_link = build_degrade_cfg(args.scale, False, "link", n_gen)
+    cfg_official = build_degrade_cfg(args.scale, True, "official", n_gen)
     train_ds = PairedDegradeDataset(
-        DIV2K / "DIV2K_train_HR",
+        args.hr_train,
         patch=args.patch,
         length=max(args.iters * args.batch, 800),
         cfg=cfg,
@@ -273,11 +334,20 @@ def main() -> int:
                 running = {"loss": 0.0, "l1": 0.0, "lpips": 0.0, "block": 0.0, "n": 0}
 
             if it % args.val_every == 0 or it == args.iters:
-                vm = validate(model, build_degrade_cfg(args.scale, flags["uniform_degrade"]), args, device)
+                # 两套退化分布各评一次：link 是目标分布，official 是对照分布
+                vm = {}
+                vm.update(validate(model, cfg_link, args, device, tag="_link"))
+                vm.update(validate(model, cfg_official, args, device, tag="_off"))
+                vm["psnr"] = vm["psnr_link"]
                 rec = {"iter": it, **vm}
                 log_f.write(json.dumps(rec) + "\n")
                 log_f.flush()
-                print(f"  [val] it {it} PSNR {vm['psnr']:.3f} 块效应 {vm['blockiness_pred']:.3f}")
+                print(
+                    f"  [val] it {it} PSNR(link) {vm['psnr_link']:.3f} "
+                    f"PSNR(off) {vm['psnr_off']:.3f} "
+                    f"块效应(最坏相位) {vm['blk_worst_link']:.3f} "
+                    f"GT {vm['blk_worst_gt_link']:.3f}"
+                )
                 torch.save({"params": model.state_dict(), "iter": it, "psnr": vm["psnr"]},
                            out_dir / "last.pth")
                 if vm["psnr"] > best_psnr:

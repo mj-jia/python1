@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,17 +21,27 @@ BLOCKINESS_EPS = 0.5 / 255.0
 # --------------------------------------------------------------------------
 # 创新二：块效应感知损失
 # --------------------------------------------------------------------------
-def blockiness_tensor(x: torch.Tensor, block: int = 8, eps: float = BLOCKINESS_EPS) -> torch.Tensor:
+def blockiness_tensor(
+    x: torch.Tensor,
+    block: int = 8,
+    eps: float = BLOCKINESS_EPS,
+    phase: tuple[int, int] = (0, 0),
+) -> torch.Tensor:
     """逐样本块效应强度 = 块边界梯度均值 / (块内梯度均值 + eps)。
 
     x    : (B,C,H,W)，值域 [0,1]
     block: 退化图上 8x8 块的**等效像素间距**。训练用 2 倍下采样时该值为 16。
+    phase: 8x8 网格原点相对图像左上角的偏移 (r,c)，用于度量非对齐网格上的块效应。
     return: (B,)
     """
     b, c, h, w = x.shape
+    pr, pc = int(phase[0]), int(phase[1])
+    if pr or pc:
+        x = x[..., pr:, pc:]
+        h, w = x.shape[-2], x.shape[-1]
     nb_h, nb_w = h // block, w // block
     if nb_h == 0 or nb_w == 0:
-        raise ValueError(f"图像尺寸 {h}x{w} 小于一个块 {block}")
+        raise ValueError(f"图像尺寸 {h}x{w} 小于一个块 {block}（phase={phase}）")
 
     x = x[..., : nb_h * block, : nb_w * block]
 
@@ -53,10 +64,16 @@ def blockiness_tensor(x: torch.Tensor, block: int = 8, eps: float = BLOCKINESS_E
 
 
 class BlockinessLoss(nn.Module):
-    """L_block = relu( blockiness(pred) - blockiness(gt) )。
+    """L_block = relu( blockiness(pred, phase) - blockiness(gt, phase) )。
 
     单向惩罚：只在"输出比 GT 更像块状"时罚，避免把正常边缘一起压掉。
     可选空间权重 w（创新三），让惩罚集中在平坦区。
+
+    phases:
+        1  —— 只在对齐网格（phase=(0,0)）上度量，即原实现；
+        N>1 —— 在 N 个候选相位上各算一次，逐样本取**先 relu 再取最大**。
+               注意顺序不能反过来：若先对 pred/gt 各自取最坏相位再相减，
+               两张图可能取到不同相位，差值没有意义，还会在干净图上误罚。
     """
 
     def __init__(
@@ -65,12 +82,23 @@ class BlockinessLoss(nn.Module):
         eps: float = BLOCKINESS_EPS,
         detach_gt: bool = True,
         relative: bool = True,
+        phases: int = 1,
     ):
         super().__init__()
         self.block = block
         self.eps = eps
         self.detach_gt = detach_gt
         self.relative = relative
+        self.phases = int(phases)
+        if self.phases <= 1:
+            self.phase_list = [(0, 0)]
+        else:
+            # 用对角相位 (d,d)：列方向与行方向都覆盖到全部 d，代价只有 8 次度量。
+            # 网格相位在真实链路里是 2D 联动的（同一代同时平移行和列），
+            # 取对角比取 4x4 叉积更省且不丢覆盖。
+            step = 1 if self.block <= 8 else max(1, self.block // 8)
+            vals = list(range(0, self.block, step))
+            self.phase_list = [(v, v) for v in vals]
 
     def forward(
         self,
@@ -78,12 +106,17 @@ class BlockinessLoss(nn.Module):
         gt: torch.Tensor,
         weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        bp = blockiness_tensor(pred, self.block, self.eps)  # (B,)
-        bg = blockiness_tensor(gt.detach() if self.detach_gt else gt, self.block, self.eps)
-        diff = F.relu(bp - bg)
-        if self.relative:
-            # 除以 GT 的块效应水平，做成无量纲相对量，便于与 L1 配权重
-            diff = diff / bg.clamp(min=0.3)
+        g = gt.detach() if self.detach_gt else gt
+        diffs = []
+        for ph in self.phase_list:
+            bp = blockiness_tensor(pred, self.block, self.eps, ph)  # (B,)
+            bg = blockiness_tensor(g, self.block, self.eps, ph)     # (B,)
+            d = F.relu(bp - bg)
+            if self.relative:
+                # 除以 GT 的块效应水平，做成无量纲相对量，便于与 L1 配权重
+                d = d / bg.clamp(min=0.3)
+            diffs.append(d)
+        diff = diffs[0] if len(diffs) == 1 else torch.stack(diffs, 0).max(0).values
 
         if weight is None:
             return diff.mean()

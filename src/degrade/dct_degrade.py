@@ -272,6 +272,16 @@ class DegradeConfig:
     do_second: bool = True
     second_q_range: tuple = (58.0, 72.0)
 
+    # ------------------------------------------------------------------
+    # 链路式多代退化（创新一的空间非均匀版）
+    # n_gen_range=None 时走上面的原有两段式，保证老实验可复现；
+    # 设成 (1,5) 这类区间则启用"每代独立参数 + 网格相位漂移"。
+    # ------------------------------------------------------------------
+    n_gen_range: tuple | None = None   # 每样本随机抽取代次
+    phase_drift: bool = False          # 每代网格原点随机偏移 (r,c)∈[0,8)
+    resize_gen_prob: float = 0.0       # 每代以该概率"降采样→回放大"，模拟平台改尺寸
+    resize_gen_range: tuple = (0.60, 0.95)
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
@@ -309,6 +319,50 @@ def _encode_once(
     return out, st
 
 
+def _resize_roundtrip(x: np.ndarray, factor: float) -> np.ndarray:
+    """降采样再放大回原尺寸：模拟平台改分辨率，尺寸不变但引入重采样模糊。"""
+    h, w = x.shape[:2]
+    nh = max(16, int(round(h * factor)) // 16 * 16)
+    nw = max(16, int(round(w * factor)) // 16 * 16)
+    y = cv2.resize(x, (nw, nh), interpolation=cv2.INTER_AREA)
+    return cv2.resize(y, (w, h), interpolation=cv2.INTER_CUBIC)
+
+
+def _gen_block_q(x: np.ndarray, cfg: "DegradeConfig", rng):
+    """按当前代次的图像内容生成本代的逐块 quality；(N,8,8) 与标量均值。"""
+    h, w = x.shape[:2]
+    n_blk = (h // BLOCK) * (w // BLOCK)
+    if cfg.uniform_quality:
+        q = float(rng.uniform(*cfg.uniform_q_range))
+        return _uniform_quality(n_blk, q, cfg.quality_jitter, rng), q
+    e = block_energy(rgb_to_ycbcr(x)[0], BLOCK)
+    bq = energy_to_quality(e, cfg.q_lo, cfg.q_hi, cfg.energy_pct, cfg.energy_gamma)
+    if cfg.quality_jitter > 0:
+        bq = np.clip(
+            bq + rng.normal(0.0, cfg.quality_jitter, size=bq.shape), 1.0, 100.0
+        ).astype(np.float32)
+    return bq, float(np.mean(bq))
+
+
+def _encode_gen(x: np.ndarray, cfg: "DegradeConfig", rng, phase: tuple[int, int]):
+    """带网格相位偏移的一代编码。
+
+    phase=(r,c)：先在左上补 r 行 c 列，编码后再裁回，使本代 8x8 网格原点
+    相对图像偏移 (8-r, 8-c) mod 8。多代累积后图里会同时存在多套相位。
+    """
+    r, c = int(phase[0]), int(phase[1])
+    h, w = x.shape[:2]
+    xp = np.pad(x, ((r, 0), (c, 0), (0, 0)), mode="symmetric") if (r or c) else x
+    ph, pw = (-xp.shape[0]) % 16, (-xp.shape[1]) % 16
+    if ph or pw:
+        xp = np.pad(xp, ((0, ph), (0, pw), (0, 0)), mode="reflect")
+    block_q, q_mean = _gen_block_q(xp, cfg, rng)
+    out, st = _encode_once(
+        xp, block_q, cfg.chroma_quality_ratio, cfg.chroma_420, rng, cfg.quality_jitter
+    )
+    return np.ascontiguousarray(out[r : r + h, c : c + w]), st, q_mean
+
+
 def degrade_image(
     img: np.ndarray,
     cfg: DegradeConfig | None = None,
@@ -344,50 +398,93 @@ def degrade_image(
 
     hs, ws = small.shape[:2]
     n_blk = (hs // BLOCK) * (ws // BLOCK)
-
-    # ---------- 第 1 步：编码压缩（非均匀 DCT） ----------
-    if cfg.uniform_quality:
-        q_img = float(rng.uniform(*cfg.uniform_q_range))
-        block_q = _uniform_quality(n_blk, q_img, cfg.quality_jitter, rng)
-    else:
-        e = block_energy(rgb_to_ycbcr(small)[0], BLOCK)
-        block_q = energy_to_quality(
-            e, cfg.q_lo, cfg.q_hi, cfg.energy_pct, cfg.energy_gamma
-        )
-        if cfg.quality_jitter > 0:
-            block_q = np.clip(
-                block_q + rng.normal(0.0, cfg.quality_jitter, size=block_q.shape),
-                1.0,
-                100.0,
-            ).astype(np.float32)
-
-    small, st1 = _encode_once(
-        small, block_q, cfg.chroma_quality_ratio, cfg.chroma_420, rng, cfg.quality_jitter
-    )
-
     info: dict[str, Any] = {
         "config": cfg.to_dict(),
         "scale": scale,
         "block_size": BLOCK * scale,
-        "quality_map": block_q.reshape(hs // BLOCK, ws // BLOCK),
-        "quality_lo": float(np.percentile(block_q, 5)),
-        "quality_hi": float(np.percentile(block_q, 95)),
-        "quality_mean": float(np.mean(block_q)),
-        "bpp_pass1": st1["bpp"],
-        "nonzero_ratio": st1["nonzero_ratio"],
-        "bpp_pass2": None,
-        "second_q": None,
     }
 
-    # ---------- 第 2 步：二次转码（均匀质量） ----------
-    if cfg.do_second:
-        q2 = float(rng.uniform(*cfg.second_q_range))
-        info["second_q"] = q2
-        q_arr2 = _uniform_quality(n_blk, q2, 0.0, rng)
-        small, st2 = _encode_once(
-            small, q_arr2, cfg.chroma_quality_ratio, cfg.chroma_420, rng
+    if cfg.n_gen_range is None:
+        # ================= 原有两段式（保证老实验可复现） =================
+        # ---------- 第 1 步：编码压缩（非均匀 DCT） ----------
+        if cfg.uniform_quality:
+            q_img = float(rng.uniform(*cfg.uniform_q_range))
+            block_q = _uniform_quality(n_blk, q_img, cfg.quality_jitter, rng)
+        else:
+            e = block_energy(rgb_to_ycbcr(small)[0], BLOCK)
+            block_q = energy_to_quality(
+                e, cfg.q_lo, cfg.q_hi, cfg.energy_pct, cfg.energy_gamma
+            )
+            if cfg.quality_jitter > 0:
+                block_q = np.clip(
+                    block_q + rng.normal(0.0, cfg.quality_jitter, size=block_q.shape),
+                    1.0,
+                    100.0,
+                ).astype(np.float32)
+
+        small, st1 = _encode_once(
+            small, block_q, cfg.chroma_quality_ratio, cfg.chroma_420, rng, cfg.quality_jitter
         )
-        info["bpp_pass2"] = st2["bpp"]
+
+        info.update(
+            {
+                "quality_map": block_q.reshape(hs // BLOCK, ws // BLOCK),
+                "quality_lo": float(np.percentile(block_q, 5)),
+                "quality_hi": float(np.percentile(block_q, 95)),
+                "quality_mean": float(np.mean(block_q)),
+                "bpp_pass1": st1["bpp"],
+                "nonzero_ratio": st1["nonzero_ratio"],
+                "bpp_pass2": None,
+                "second_q": None,
+            }
+        )
+
+        # ---------- 第 2 步：二次转码（均匀质量） ----------
+        if cfg.do_second:
+            q2 = float(rng.uniform(*cfg.second_q_range))
+            info["second_q"] = q2
+            q_arr2 = _uniform_quality(n_blk, q2, 0.0, rng)
+            small, st2 = _encode_once(
+                small, q_arr2, cfg.chroma_quality_ratio, cfg.chroma_420, rng
+            )
+            info["bpp_pass2"] = st2["bpp"]
+    else:
+        # ============ 链路式：N 代非同质重编码 + 网格相位漂移 ============
+        lo, hi = int(cfg.n_gen_range[0]), int(cfg.n_gen_range[1])
+        n_gen = int(rng.integers(lo, hi + 1))
+        phases: list[list[int]] = []
+        gen_q: list[float] = []
+        gen_bpp: list[float] = []
+        for _ in range(n_gen):
+            # 平台改尺寸：每代都有一定概率经历一次"降采样→回放大"
+            if cfg.resize_gen_prob > 0.0 and rng.random() < cfg.resize_gen_prob:
+                small = _resize_roundtrip(small, float(rng.uniform(*cfg.resize_gen_range)))
+            phase = (
+                (int(rng.integers(0, BLOCK)), int(rng.integers(0, BLOCK)))
+                if cfg.phase_drift
+                else (0, 0)
+            )
+            small, st, qm = _encode_gen(small, cfg, rng, phase)
+            phases.append([int(phase[0]), int(phase[1])])
+            gen_q.append(qm)
+            gen_bpp.append(float(st["bpp"]))
+
+        info.update(
+            {
+                "n_gen": n_gen,
+                "phases": phases,
+                "gen_quality": gen_q,
+                "gen_bpp": gen_bpp,
+                "quality_map": None,
+                "quality_lo": float(min(gen_q)),
+                "quality_hi": float(max(gen_q)),
+                "quality_mean": float(np.mean(gen_q)),
+                "bpp_pass1": gen_bpp[0] if gen_bpp else None,
+                "nonzero_ratio": None,
+                "bpp_pass2": gen_bpp[1] if len(gen_bpp) > 1 else None,
+                "second_q": None,
+            }
+        )
 
     # ---------- 第 3 步：显示端插值放大 ----------
     if scale > 1:
